@@ -1,5 +1,5 @@
 """
-App commands: remake app launch|stop|status|list|logs
+App commands: remake app install|uninstall|launch|stop|status|list|logs
 """
 
 import click
@@ -20,9 +20,13 @@ def app(ctx):
 
     \b
     Commands:
-        launch  - Launch an app on the robot
-        stop    - Stop a running app
-        list    - List installed apps
+        install   - Install an app
+        uninstall - Remove an app
+        launch    - Launch an app on the robot
+        stop      - Stop a running app
+        status    - Show running apps
+        list      - List installed apps
+        logs      - View app logs
     """
     pass
 

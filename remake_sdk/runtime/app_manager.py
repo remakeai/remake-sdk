@@ -105,41 +105,57 @@ class AppManager:
 
         logger.info(f"Installing app {app_id} from {container_image}")
 
-        # Pull the image
+        # Check if image already exists locally
+        image_exists = False
         try:
             result = subprocess.run(
-                ["podman", "pull", container_image],
+                ["podman", "image", "exists", container_image],
                 capture_output=True,
-                text=True,
-                timeout=300  # 5 minute timeout for large images
+                timeout=10
             )
+            image_exists = result.returncode == 0
+        except Exception:
+            pass
 
-            if result.returncode != 0:
-                logger.error(f"Failed to pull image: {result.stderr}")
+        # Pull the image only if it doesn't exist locally
+        if not image_exists:
+            try:
+                logger.info(f"Pulling image {container_image}...")
+                result = subprocess.run(
+                    ["podman", "pull", container_image],
+                    capture_output=True,
+                    text=True,
+                    timeout=300  # 5 minute timeout for large images
+                )
+
+                if result.returncode != 0:
+                    logger.error(f"Failed to pull image: {result.stderr}")
+                    return InstallResult(
+                        success=False,
+                        app_id=app_id,
+                        container_image=container_image,
+                        error="pull_failed",
+                        message=f"Failed to pull image: {result.stderr.strip()}"
+                    )
+
+            except subprocess.TimeoutExpired:
                 return InstallResult(
                     success=False,
                     app_id=app_id,
                     container_image=container_image,
-                    error="pull_failed",
-                    message=result.stderr.strip()
+                    error="timeout",
+                    message="Image pull timed out"
                 )
-
-        except subprocess.TimeoutExpired:
-            return InstallResult(
-                success=False,
-                app_id=app_id,
-                container_image=container_image,
-                error="timeout",
-                message="Image pull timed out"
-            )
-        except Exception as e:
-            return InstallResult(
-                success=False,
-                app_id=app_id,
-                container_image=container_image,
-                error="exception",
-                message=str(e)
-            )
+            except Exception as e:
+                return InstallResult(
+                    success=False,
+                    app_id=app_id,
+                    container_image=container_image,
+                    error="exception",
+                    message=str(e)
+                )
+        else:
+            logger.info(f"Image {container_image} already exists locally")
 
         # Register the app
         app = InstalledApp(
