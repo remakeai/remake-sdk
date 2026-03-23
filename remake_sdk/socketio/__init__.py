@@ -2,24 +2,37 @@
 Socket.IO SDK - Robot-to-app communication.
 
 This module handles communication between the robot runtime and apps:
-- Socket.IO server for app connections
-- Message handling per ROBOT_APP_API.md
-- Entitlement enforcement
+- RobotClient: For apps to connect to and communicate with the robot
+- MockRobotServer: For testing apps without a real robot
 
-Example:
-    from remake_sdk.socketio import AppServer
+Example (App side):
+    from remake_sdk.socketio import RobotClient
 
-    server = AppServer(socket_path="/var/run/remake/robot.sock")
+    client = RobotClient()
+    await client.connect()
 
-    @server.on_move_cmd
-    def handle_move(cmd):
-        publish_to_ros2(cmd)
+    await client.log("App started!")
+    await client.move(linear_x=0.5)
 
+    @client.on_battery
+    def handle_battery(data):
+        print(f"Battery: {data['level']}%")
+
+    await client.run()
+
+Example (Testing with mock server):
+    from remake_sdk.socketio import MockRobotServer
+
+    server = MockRobotServer(port=8788)
     await server.start()
+    # Apps can now connect to http://localhost:8788
 """
 
-# TODO: Implement in Phase 3
-# from .server import AppServer
-# from .messages import MoveCmd, StopCmd, NavigateCmd
+from .client import RobotClient
+from .mock_server import MockRobotServer, run_mock_server
 
-__all__ = []
+__all__ = [
+    "RobotClient",
+    "MockRobotServer",
+    "run_mock_server",
+]

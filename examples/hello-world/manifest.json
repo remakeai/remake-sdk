@@ -1,0 +1,9 @@
+{
+  "app_id": "com.example.hello-world",
+  "name": "Hello World",
+  "version": "1.0.0",
+  "description": "A simple hello world app for testing the Remake runtime",
+  "author": "Example Developer",
+  "entitlements": [],
+  "main": "app.py"
+}

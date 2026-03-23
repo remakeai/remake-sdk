@@ -1,0 +1,12 @@
+{
+  "app_id": "com.example.robot-chat",
+  "name": "Robot Chat",
+  "version": "1.0.0",
+  "description": "Sample app demonstrating robot SDK communication",
+  "author": "Example Developer",
+  "entitlements": [
+    "movement",
+    "audio_playback"
+  ],
+  "main": "app.py"
+}
