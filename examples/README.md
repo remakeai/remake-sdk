@@ -36,6 +36,28 @@ cd robot-chat
 ../../.venv/bin/python app.py
 ```
 
+### [app-dashboard](app-dashboard/)
+
+A web-based dashboard app demonstrating:
+- Web server accessible from outside the container
+- REST API for programmatic control
+- Real-time sensor data display in browser
+- Movement controls via web UI
+- Container port mapping
+
+```bash
+# Terminal 1: Start mock server
+python -m remake_sdk.socketio.mock_server
+
+# Terminal 2: Run app
+cd app-dashboard
+pip install flask
+../../.venv/bin/python app.py
+
+# Terminal 3: Open browser
+open http://localhost:8080
+```
+
 ## Running Examples
 
 Most examples require the SDK to be installed or available in the Python path:

@@ -95,10 +95,15 @@ def launch_local(app_id: str, image: str = None):
             timeout=10
         )
 
-        # Start container
+        # Start container with APP_ID label
         click.echo(f"Starting container {app_id}...")
         result = subprocess.run(
-            ["podman", "run", "-d", "--rm", "--name", app_id, container_image],
+            [
+                "podman", "run", "-d", "--rm",
+                "--name", app_id,
+                "--label", f"remake.app_id={app_id}",
+                container_image
+            ],
             capture_output=True,
             text=True,
             timeout=60
@@ -199,55 +204,124 @@ def launch_via_platform(app_id: str, platform: str, timeout: int):
 
 
 @app.command()
-@click.argument("app_id")
+@click.argument("app_id", required=False)
 @click.option("--local", "-l", is_flag=True, help="Stop locally without contacting platform")
 @click.option("--platform", "-p", default=None, help="Platform URL override")
 @click.option("--timeout", "-t", default=30, help="Timeout in seconds")
 @click.option("--force", "-f", is_flag=True, help="Force stop (kill container)")
+@click.option("--all", "-a", "stop_all", is_flag=True, help="Stop all running apps")
 @click.pass_context
-def stop(ctx, app_id, local, platform, timeout, force):
+def stop(ctx, app_id, local, platform, timeout, force, stop_all):
     """
     Stop a running app on the robot.
 
-    By default, sends a stop request to the platform. Use --local
-    to stop the app directly using Podman without contacting the cloud.
+    If APP_ID is not specified, stops all running apps (or prompts if multiple).
+    Auto-detects local mode when robot is not paired with platform.
 
     \b
     Examples:
+        remake app stop                           # Stop all running apps
         remake app stop com.funrobots.chase-game
-        remake app stop myapp --local
-        remake app stop myapp --local --force
+        remake app stop --all                     # Stop all without prompting
+        remake app stop myapp --force             # Force kill
     """
+    # Auto-detect local mode:
+    # 1. If no APP_ID specified and local containers exist, use local mode
+    # 2. If robot not paired with platform, use local mode
+    if not local:
+        if not app_id:
+            # No APP_ID - check if there are local containers to stop
+            running = get_running_apps()
+            if running:
+                local = True
+            else:
+                click.echo("No apps currently running.")
+                return
+        else:
+            # APP_ID specified - use local mode if not paired
+            robot_id, robot_secret = get_robot_credentials()
+            if not robot_id or not robot_secret:
+                local = True
+
     if local:
-        stop_local(app_id, force)
+        stop_local(app_id, force, stop_all)
     else:
         stop_via_platform(app_id, platform, timeout)
 
 
-def stop_local(app_id: str, force: bool = False):
+def get_running_apps():
+    """Get list of running app containers."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["podman", "ps", "--format", "{{.Names}}"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            return [name.strip() for name in result.stdout.strip().split("\n") if name.strip()]
+        return []
+    except:
+        return []
+
+
+def stop_local(app_id: str = None, force: bool = False, stop_all: bool = False):
     """Stop app locally using Podman."""
     import subprocess
 
-    click.echo(f"Stopping app locally: {app_id}")
+    # If no app_id specified, find running apps
+    if not app_id:
+        running = get_running_apps()
+
+        if not running:
+            click.echo("No apps currently running.")
+            return
+
+        if len(running) == 1:
+            app_id = running[0]
+            click.echo(f"Found running app: {app_id}")
+        elif stop_all:
+            # Stop all apps
+            click.echo(f"Stopping {len(running)} app(s)...")
+            for name in running:
+                _stop_container(name, force)
+            return
+        else:
+            # Multiple apps - list them and ask
+            click.echo("Multiple apps running:")
+            for i, name in enumerate(running, 1):
+                click.echo(f"  {i}. {name}")
+            click.echo()
+            click.echo("Specify an APP_ID or use --all to stop all apps.")
+            return
+
+    _stop_container(app_id, force)
+
+
+def _stop_container(app_id: str, force: bool = False):
+    """Stop a single container."""
+    import subprocess
+
+    click.echo(f"Stopping: {app_id}")
 
     try:
         cmd = ["podman", "kill" if force else "stop", app_id]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
 
         if result.returncode == 0:
-            click.echo(click.style("App stopped!", fg="green"))
+            click.echo(click.style(f"  Stopped {app_id}", fg="green"))
         elif "no such container" in result.stderr.lower():
-            click.echo(f"App {app_id} is not running.")
+            click.echo(f"  App {app_id} is not running.")
         else:
-            click.echo(f"Error: {result.stderr.strip()}", err=True)
-            sys.exit(1)
+            click.echo(f"  Error: {result.stderr.strip()}", err=True)
 
     except FileNotFoundError:
         click.echo("Podman is not installed.", err=True)
         sys.exit(1)
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
 
 
 def stop_via_platform(app_id: str, platform: str, timeout: int):
@@ -377,9 +451,9 @@ def status(ctx, as_json):
     import subprocess
 
     try:
-        # Use subprocess for reliability (Podman SDK has socket issues)
+        # Get container info including labels for full APP_ID
         result = subprocess.run(
-            ["podman", "ps", "--format", "{{.Names}}|{{.ID}}|{{.Status}}|{{.Image}}"],
+            ["podman", "ps", "--format", "{{.Names}}|{{.ID}}|{{.Status}}|{{.Image}}|{{.Labels}}"],
             capture_output=True,
             text=True,
             timeout=10
@@ -395,8 +469,20 @@ def status(ctx, as_json):
                 continue
             parts = line.split("|")
             if len(parts) >= 4:
+                container_name = parts[0]
+                labels = parts[4] if len(parts) > 4 else ""
+
+                # Extract APP_ID from label if present, otherwise use container name
+                app_id = container_name
+                if "remake.app_id=" in labels:
+                    for label in labels.split(","):
+                        if label.startswith("remake.app_id="):
+                            app_id = label.split("=", 1)[1]
+                            break
+
                 apps.append({
-                    "app_id": parts[0],
+                    "app_id": app_id,
+                    "container_name": container_name,
                     "container_id": parts[1][:12],
                     "status": parts[2],
                     "image": parts[3],
@@ -416,7 +502,7 @@ def status(ctx, as_json):
         for app_info in apps:
             click.echo()
             click.echo(f"  {click.style(app_info['app_id'], bold=True)}")
-            click.echo(f"    Container: {app_info['container_id']}")
+            click.echo(f"    Container: {app_info['container_id']} ({app_info['container_name']})")
             click.echo(f"    Image:     {app_info['image']}")
             click.echo(f"    Status:    {click.style(app_info['status'], fg='green')}")
 
@@ -425,7 +511,7 @@ def status(ctx, as_json):
         click.echo()
         click.echo("Commands:")
         click.echo(f"  View logs:  remake app logs <app_id>")
-        click.echo(f"  Stop app:   remake app stop <app_id> --local")
+        click.echo(f"  Stop app:   remake app stop [app_id]")
 
     except FileNotFoundError:
         click.echo("Podman is not installed.", err=True)
