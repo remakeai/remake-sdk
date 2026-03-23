@@ -8,7 +8,7 @@ from typing import Optional, List, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 
-from .app_registry import AppRegistry, InstalledApp
+from .app_registry import AppRegistry, InstalledApp, PortMapping
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,8 @@ class AppManager:
         name: Optional[str] = None,
         description: Optional[str] = None,
         entitlements: Optional[List[str]] = None,
-        source: str = "local"
+        source: str = "local",
+        manifest: Optional[dict] = None
     ) -> InstallResult:
         """
         Install an app by pulling its container image.
@@ -87,6 +88,7 @@ class AppManager:
             description: App description
             entitlements: List of required permissions
             source: "local" or "platform"
+            manifest: Full manifest dict (ports, environment, etc.)
 
         Returns:
             InstallResult with success status
@@ -157,6 +159,33 @@ class AppManager:
         else:
             logger.info(f"Image {container_image} already exists locally")
 
+        # Extract ports and environment from manifest
+        ports = None
+        environment = None
+        if manifest:
+            # Get name/description from manifest if not provided
+            if not name:
+                name = manifest.get("name")
+            if not description:
+                description = manifest.get("description")
+            if not entitlements:
+                entitlements = manifest.get("capabilities") or manifest.get("entitlements")
+
+            # Parse ports
+            if manifest.get("ports"):
+                ports = [
+                    PortMapping(
+                        container=p.get("container"),
+                        host=p.get("host", p.get("container")),
+                        protocol=p.get("protocol", "tcp"),
+                        description=p.get("description"),
+                    )
+                    for p in manifest["ports"]
+                ]
+
+            # Get environment
+            environment = manifest.get("environment")
+
         # Register the app
         app = InstalledApp(
             app_id=app_id,
@@ -166,7 +195,9 @@ class AppManager:
             description=description,
             entitlements=entitlements,
             installed_at=datetime.utcnow().isoformat(),
-            source=source
+            source=source,
+            ports=ports,
+            environment=environment,
         )
         self.registry.add(app)
 

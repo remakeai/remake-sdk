@@ -11,6 +11,15 @@ from datetime import datetime
 
 
 @dataclass
+class PortMapping:
+    """Container port mapping."""
+    container: int
+    host: int
+    protocol: str = "tcp"
+    description: Optional[str] = None
+
+
+@dataclass
 class InstalledApp:
     """Metadata for an installed app."""
     app_id: str
@@ -21,9 +30,15 @@ class InstalledApp:
     entitlements: Optional[List[str]] = None
     installed_at: Optional[str] = None
     source: str = "local"  # "local" or "platform"
+    ports: Optional[List[PortMapping]] = None
+    environment: Optional[dict] = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        # Convert PortMapping objects to dicts
+        if self.ports:
+            d['ports'] = [asdict(p) if isinstance(p, PortMapping) else p for p in self.ports]
+        return d
 
 
 class AppRegistry:
@@ -52,18 +67,37 @@ class AppRegistry:
                     description TEXT,
                     entitlements TEXT,
                     installed_at TEXT NOT NULL,
-                    source TEXT DEFAULT 'local'
+                    source TEXT DEFAULT 'local',
+                    ports TEXT,
+                    environment TEXT
                 )
             """)
+            # Migrate: add new columns if they don't exist
+            try:
+                conn.execute("ALTER TABLE installed_apps ADD COLUMN ports TEXT")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            try:
+                conn.execute("ALTER TABLE installed_apps ADD COLUMN environment TEXT")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
             conn.commit()
 
     def add(self, app: InstalledApp) -> bool:
         """Add or update an installed app."""
+        # Serialize ports
+        ports_json = None
+        if app.ports:
+            ports_json = json.dumps([
+                asdict(p) if isinstance(p, PortMapping) else p
+                for p in app.ports
+            ])
+
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO installed_apps
-                (app_id, version, container_image, name, description, entitlements, installed_at, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (app_id, version, container_image, name, description, entitlements, installed_at, source, ports, environment)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 app.app_id,
                 app.version,
@@ -72,7 +106,9 @@ class AppRegistry:
                 app.description,
                 json.dumps(app.entitlements) if app.entitlements else None,
                 app.installed_at or datetime.utcnow().isoformat(),
-                app.source
+                app.source,
+                ports_json,
+                json.dumps(app.environment) if app.environment else None,
             ))
             conn.commit()
         return True
@@ -118,6 +154,23 @@ class AppRegistry:
             except json.JSONDecodeError:
                 pass
 
+        ports = None
+        try:
+            ports_raw = row["ports"]
+            if ports_raw:
+                ports_data = json.loads(ports_raw)
+                ports = [PortMapping(**p) for p in ports_data]
+        except (KeyError, json.JSONDecodeError):
+            pass
+
+        environment = None
+        try:
+            env_raw = row["environment"]
+            if env_raw:
+                environment = json.loads(env_raw)
+        except (KeyError, json.JSONDecodeError):
+            pass
+
         return InstalledApp(
             app_id=row["app_id"],
             version=row["version"],
@@ -126,7 +179,9 @@ class AppRegistry:
             description=row["description"],
             entitlements=entitlements,
             installed_at=row["installed_at"],
-            source=row["source"]
+            source=row["source"],
+            ports=ports,
+            environment=environment,
         )
 
     def is_installed(self, app_id: str) -> bool:

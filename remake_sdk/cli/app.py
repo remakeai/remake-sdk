@@ -37,8 +37,11 @@ def app(ctx):
 @click.option("--platform", "-p", default=None, help="Platform URL override")
 @click.option("--timeout", "-t", default=30, help="Timeout in seconds")
 @click.option("--image", default=None, help="Container image override (for --local)")
+@click.option("--port", "ports", multiple=True, help="Port mapping (e.g., --port 8080:8080)")
+@click.option("--network-host", is_flag=True, help="Use host network (exposes all ports)")
+@click.option("--env", "-e", "env_vars", multiple=True, help="Environment variable (e.g., -e KEY=value)")
 @click.pass_context
-def launch(ctx, app_id, local, platform, timeout, image):
+def launch(ctx, app_id, local, platform, timeout, image, ports, network_host, env_vars):
     """
     Launch an app on the robot.
 
@@ -46,34 +49,58 @@ def launch(ctx, app_id, local, platform, timeout, image):
     to launch the app directly using Podman without contacting the
     cloud (useful for offline operation or development).
 
+    Port mappings are read from the app manifest automatically.
+    Use --port to override or --network-host to expose all ports.
+
     \b
     Examples:
         remake app launch com.funrobots.chase-game
         remake app launch com.example.myapp --local
         remake app launch myapp --local --image localhost/myapp:dev
+        remake app launch myapp --local --port 8080:8080
+        remake app launch myapp --local --network-host
     """
+    # Parse environment variables
+    env_dict = {}
+    for env in env_vars:
+        if '=' in env:
+            key, value = env.split('=', 1)
+            env_dict[key] = value
+
+    # Parse port mappings
+    port_list = list(ports) if ports else None
+
     if local:
-        launch_local(app_id, image)
+        launch_local(app_id, image, ports=port_list, network_host=network_host, env_vars=env_dict)
     else:
         launch_via_platform(app_id, platform, timeout)
 
 
-def launch_local(app_id: str, image: str = None):
+def launch_local(app_id: str, image: str = None, ports: list = None, network_host: bool = False, env_vars: dict = None):
     """Launch app locally using Podman."""
     import subprocess
 
     click.echo(f"Launching app locally: {app_id}")
 
-    # Determine container image
+    # Determine container image and get app config from registry
     container_image = image
+    app_ports = ports or []
+    app_env = env_vars or {}
+
     if not container_image:
-        # Try to get from registry or use convention
+        # Try to get from registry
         try:
             from ..runtime.app_registry import AppRegistry
             registry = AppRegistry()
             app_info = registry.get(app_id)
             if app_info:
                 container_image = app_info.container_image
+                # Get ports from registry if not specified
+                if not app_ports and app_info.ports:
+                    app_ports = app_info.ports
+                # Get environment from registry
+                if app_info.environment:
+                    app_env = {**app_info.environment, **app_env}
         except:
             pass
 
@@ -95,15 +122,48 @@ def launch_local(app_id: str, image: str = None):
             timeout=10
         )
 
-        # Start container with APP_ID label
+        # Build podman command
+        cmd = ["podman", "run", "-d", "--rm", "--name", app_id]
+
+        # Add label for tracking
+        cmd.extend(["--label", f"remake.app_id={app_id}"])
+
+        # Network mode
+        if network_host:
+            cmd.extend(["--network", "host"])
+        else:
+            # Add port mappings
+            for port in app_ports:
+                if hasattr(port, 'container'):
+                    # PortMapping object
+                    cmd.extend(["-p", f"{port.host}:{port.container}"])
+                elif isinstance(port, dict):
+                    # Dict from manifest
+                    cmd.extend(["-p", f"{port['host']}:{port['container']}"])
+                elif isinstance(port, str):
+                    # String like "8080:8080"
+                    cmd.extend(["-p", port])
+
+        # Add environment variables
+        for key, value in app_env.items():
+            cmd.extend(["-e", f"{key}={value}"])
+
+        cmd.append(container_image)
+
+        # Start container
         click.echo(f"Starting container {app_id}...")
+        if app_ports and not network_host:
+            port_list = []
+            for p in app_ports:
+                if hasattr(p, 'host'):
+                    port_list.append(str(p.host))
+                elif isinstance(p, dict):
+                    port_list.append(str(p.get('host', p.get('container'))))
+            if port_list:
+                click.echo(f"Exposing ports: {', '.join(port_list)}")
+
         result = subprocess.run(
-            [
-                "podman", "run", "-d", "--rm",
-                "--name", app_id,
-                "--label", f"remake.app_id={app_id}",
-                container_image
-            ],
+            cmd,
             capture_output=True,
             text=True,
             timeout=60
@@ -116,9 +176,21 @@ def launch_local(app_id: str, image: str = None):
         container_id = result.stdout.strip()[:12]
         click.echo(click.style("App launched!", fg="green"))
         click.echo(f"Container ID: {container_id}")
+
+        # Show access URLs for exposed ports
+        if app_ports and not network_host:
+            click.echo()
+            for p in app_ports:
+                host_port = p.host if hasattr(p, 'host') else p.get('host')
+                desc = getattr(p, 'description', None) or p.get('description', '')
+                if desc:
+                    click.echo(f"  http://localhost:{host_port} - {desc}")
+                else:
+                    click.echo(f"  http://localhost:{host_port}")
+
         click.echo()
         click.echo(f"View logs: remake app logs {app_id}")
-        click.echo(f"Stop app:  remake app stop {app_id} --local")
+        click.echo(f"Stop app:  remake app stop {app_id}")
 
     except FileNotFoundError:
         click.echo("Podman is not installed.", err=True)
@@ -573,6 +645,9 @@ def list_local_apps(as_json: bool):
             click.echo(f"    Version:  {app.version}")
             click.echo(f"    Image:    {app.container_image}")
             click.echo(f"    Source:   {app.source}")
+            if app.ports:
+                port_strs = [str(p.host) if hasattr(p, 'host') else str(p.get('host')) for p in app.ports]
+                click.echo(f"    Ports:    {', '.join(port_strs)}")
             click.echo(f"    Installed: {app.installed_at[:19] if app.installed_at else 'unknown'}")
 
         click.echo()
@@ -657,21 +732,39 @@ def is_runtime_running() -> bool:
 @click.argument("app_id")
 @click.option("--version", "-v", default="latest", help="App version (default: latest)")
 @click.option("--image", default=None, help="Container image URL (overrides default registry)")
+@click.option("--manifest", "-m", default=None, type=click.Path(exists=True), help="Path to manifest.json file")
 @click.pass_context
-def install(ctx, app_id, version, image):
+def install(ctx, app_id, version, image, manifest):
     """
     Install an app by pulling its container image.
 
     If runtime is running, uses the runtime API.
     Otherwise, operates directly via Podman.
 
+    Use --manifest to specify a manifest.json file containing
+    port mappings, environment variables, and other settings.
+
     \b
     Examples:
         remake app install com.funrobots.chase-game
         remake app install com.funrobots.chase-game --version 1.2.0
         remake app install myapp --image localhost/myapp:dev
+        remake app install myapp --image localhost/myapp:dev --manifest ./manifest.json
     """
     import requests
+
+    # Load manifest if provided
+    manifest_data = None
+    if manifest:
+        try:
+            with open(manifest) as f:
+                manifest_data = json.load(f)
+            click.echo(f"Loaded manifest from {manifest}")
+            # Use manifest values as defaults
+            if not version or version == "latest":
+                version = manifest_data.get("version", version)
+        except Exception as e:
+            click.echo(f"Warning: Could not load manifest: {e}", err=True)
 
     click.echo(f"Installing app: {app_id}")
     if version != "latest":
@@ -687,7 +780,8 @@ def install(ctx, app_id, version, image):
                     "app_id": app_id,
                     "version": version,
                     "container_image": image,
-                    "source": "local"
+                    "source": "local",
+                    "manifest": manifest_data,
                 },
                 timeout=300  # 5 min for large images
             )
@@ -716,12 +810,15 @@ def install(ctx, app_id, version, image):
             app_id=app_id,
             version=version,
             container_image=image,
-            source="local"
+            source="local",
+            manifest=manifest_data,
         )
 
         if result.success:
             click.echo(click.style("App installed!", fg="green"))
             click.echo(f"Image: {result.container_image}")
+            if manifest_data and manifest_data.get("ports"):
+                click.echo(f"Ports: {', '.join(str(p.get('host', p.get('container'))) for p in manifest_data['ports'])}")
         else:
             click.echo(click.style(f"Install failed: {result.message}", fg="red"), err=True)
             sys.exit(1)
