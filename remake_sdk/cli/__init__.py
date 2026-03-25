@@ -19,6 +19,7 @@ from .status import status
 from .connect import connect
 from .app import app
 from .runtime import runtime
+from .dashboard import dashboard
 
 
 def async_command(f):
@@ -50,6 +51,7 @@ cli.add_command(status)
 cli.add_command(connect)
 cli.add_command(app)
 cli.add_command(runtime)
+cli.add_command(dashboard)
 
 
 def main():

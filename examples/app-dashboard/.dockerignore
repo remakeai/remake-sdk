@@ -1,0 +1,12 @@
+# Ignore development files
+.env
+.env.*
+*.pem
+*.key
+.git
+.gitignore
+__pycache__
+*.pyc
+.venv
+venv
+README.md

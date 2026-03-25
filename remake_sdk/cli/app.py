@@ -886,3 +886,410 @@ def uninstall(ctx, app_id, keep_image):
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
+
+
+# Valid capability names that apps can request
+VALID_CAPABILITIES = {
+    "movement",
+    "navigation",
+    "camera",
+    "audio_playback",
+    "audio_capture",
+    "sensors",
+    "mapping",
+    "localization",
+    "network",
+    "storage",
+}
+
+# Patterns that might indicate secrets
+SECRET_PATTERNS = [
+    r'(?i)(api[_-]?key|apikey)\s*[=:]\s*["\']?[a-zA-Z0-9]{16,}',
+    r'(?i)(secret|password|passwd|pwd)\s*[=:]\s*["\']?[^\s"\']{8,}',
+    r'(?i)(aws[_-]?access|aws[_-]?secret)',
+    r'(?i)(private[_-]?key|priv[_-]?key)',
+    r'(?i)bearer\s+[a-zA-Z0-9\-_.]+',
+]
+
+# Files that commonly contain secrets
+SECRET_FILES = [
+    '.env',
+    '.env.local',
+    '.env.production',
+    'credentials.json',
+    'secrets.json',
+    'config.secret.json',
+    '*.pem',
+    '*.key',
+    'id_rsa',
+    'id_ed25519',
+]
+
+
+@app.command()
+@click.argument("path", type=click.Path(exists=True), default=".")
+@click.option("--fix", is_flag=True, help="Auto-fix simple issues (not yet implemented)")
+@click.option("--strict", is_flag=True, help="Treat warnings as errors")
+@click.pass_context
+def lint(ctx, path, fix, strict):
+    """
+    Validate app manifest and structure.
+
+    Checks manifest.json, Dockerfile, capabilities, and file structure.
+    Can lint a directory (app source).
+
+    \b
+    Examples:
+        remake app lint ./my-app/
+        remake app lint .
+        remake app lint --strict
+    """
+    import os
+    import re
+    from pathlib import Path
+
+    app_path = Path(path).resolve()
+
+    click.echo(f"Linting app: {app_path}")
+    click.echo()
+
+    errors = []
+    warnings = []
+
+    def error(msg):
+        errors.append(msg)
+        click.echo(click.style(f"  ERROR: {msg}", fg="red"))
+
+    def warn(msg):
+        warnings.append(msg)
+        click.echo(click.style(f"  WARN:  {msg}", fg="yellow"))
+
+    def ok(msg):
+        click.echo(click.style(f"  OK:    {msg}", fg="green"))
+
+    def info(msg):
+        click.echo(f"  INFO:  {msg}")
+
+    # 1. Check manifest.json
+    click.echo("Checking manifest.json...")
+    manifest_path = app_path / "manifest.json"
+    manifest = None
+
+    if not manifest_path.exists():
+        error("manifest.json not found")
+    else:
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            ok("manifest.json is valid JSON")
+        except json.JSONDecodeError as e:
+            error(f"manifest.json is invalid JSON: {e}")
+
+    # 2. Validate manifest fields
+    if manifest:
+        click.echo("Checking manifest fields...")
+
+        # Required fields (id or app_id accepted)
+        if "id" not in manifest and "app_id" not in manifest:
+            error("Missing required field: id (or app_id)")
+        else:
+            ok(f"Has required field: {'id' if 'id' in manifest else 'app_id'}")
+
+        for field in ["name", "version"]:
+            if field not in manifest:
+                error(f"Missing required field: {field}")
+            else:
+                ok(f"Has required field: {field}")
+
+        # Validate app ID format
+        app_id = manifest.get("id") or manifest.get("app_id", "")
+        if app_id:
+            if not re.match(r'^[a-z][a-z0-9]*(\.[a-z][a-z0-9-]*)+$', app_id):
+                warn(f"App ID '{app_id}' should be reverse-domain format (e.g., com.example.myapp)")
+            else:
+                ok(f"App ID format valid: {app_id}")
+
+        # Validate version format
+        version = manifest.get("version", "")
+        if version:
+            if not re.match(r'^\d+\.\d+\.\d+(-[a-zA-Z0-9]+)?$', version):
+                warn(f"Version '{version}' should be semver format (e.g., 1.0.0)")
+            else:
+                ok(f"Version format valid: {version}")
+
+        # Validate capabilities
+        capabilities = manifest.get("capabilities", [])
+        if capabilities:
+            click.echo("Checking capabilities...")
+            for cap in capabilities:
+                if cap in VALID_CAPABILITIES:
+                    ok(f"Valid capability: {cap}")
+                else:
+                    warn(f"Unknown capability: {cap} (valid: {', '.join(sorted(VALID_CAPABILITIES))})")
+
+        # Validate ports
+        ports = manifest.get("ports", [])
+        if ports:
+            click.echo("Checking port mappings...")
+            for port in ports:
+                container_port = port.get("container")
+                host_port = port.get("host", container_port)
+
+                if not container_port:
+                    error("Port mapping missing 'container' field")
+                elif not isinstance(container_port, int) or container_port < 1 or container_port > 65535:
+                    error(f"Invalid container port: {container_port}")
+                elif host_port and (not isinstance(host_port, int) or host_port < 1 or host_port > 65535):
+                    error(f"Invalid host port: {host_port}")
+                else:
+                    ok(f"Port mapping: {host_port}:{container_port}")
+
+                # Warn about privileged ports
+                if host_port and host_port < 1024:
+                    warn(f"Port {host_port} is privileged (requires root)")
+
+    # 3. Check Dockerfile
+    click.echo("Checking Dockerfile...")
+    dockerfile_path = app_path / "Dockerfile"
+
+    if not dockerfile_path.exists():
+        error("Dockerfile not found")
+    else:
+        ok("Dockerfile present")
+
+        # Check Dockerfile contents
+        with open(dockerfile_path) as f:
+            dockerfile = f.read()
+
+        # Check for EXPOSE
+        if manifest and manifest.get("ports"):
+            for port in manifest["ports"]:
+                container_port = port.get("container")
+                if container_port and f"EXPOSE {container_port}" not in dockerfile:
+                    warn(f"Dockerfile should EXPOSE {container_port} (declared in manifest)")
+
+        # Check for CMD or ENTRYPOINT
+        if "CMD " not in dockerfile and "ENTRYPOINT " not in dockerfile:
+            warn("Dockerfile has no CMD or ENTRYPOINT")
+        else:
+            ok("Dockerfile has CMD or ENTRYPOINT")
+
+    # 4. Check for app entry point
+    click.echo("Checking app structure...")
+    entry_points = ["app.py", "main.py", "src/main.py", "src/app.py"]
+    found_entry = None
+    for entry in entry_points:
+        if (app_path / entry).exists():
+            found_entry = entry
+            break
+
+    if found_entry:
+        ok(f"Entry point found: {found_entry}")
+    else:
+        info("No standard entry point (app.py, main.py) - check Dockerfile CMD")
+
+    # 5. Check for secrets
+    click.echo("Checking for secrets...")
+    secrets_found = False
+
+    # Check for secret files
+    for pattern in SECRET_FILES:
+        if '*' in pattern:
+            matches = list(app_path.glob(pattern))
+        else:
+            matches = [app_path / pattern] if (app_path / pattern).exists() else []
+
+        for match in matches:
+            if match.exists():
+                warn(f"Potential secret file: {match.name} (should not be in container)")
+                secrets_found = True
+
+    # Check .dockerignore
+    dockerignore_path = app_path / ".dockerignore"
+    if dockerignore_path.exists():
+        ok(".dockerignore present")
+        with open(dockerignore_path) as f:
+            dockerignore = f.read()
+        if ".env" not in dockerignore:
+            warn(".dockerignore should exclude .env files")
+    else:
+        warn("No .dockerignore file (secrets might leak into image)")
+
+    # Scan Python files for hardcoded secrets
+    for py_file in app_path.glob("**/*.py"):
+        if ".venv" in str(py_file) or "node_modules" in str(py_file):
+            continue
+        try:
+            with open(py_file) as f:
+                content = f.read()
+            for pattern in SECRET_PATTERNS:
+                if re.search(pattern, content):
+                    warn(f"Potential hardcoded secret in {py_file.relative_to(app_path)}")
+                    secrets_found = True
+                    break
+        except Exception:
+            pass
+
+    if not secrets_found:
+        ok("No obvious secrets found")
+
+    # 6. Check README
+    click.echo("Checking documentation...")
+    readme_files = ["README.md", "README.txt", "README"]
+    has_readme = any((app_path / r).exists() for r in readme_files)
+    if has_readme:
+        ok("README present")
+    else:
+        info("No README file (optional but recommended)")
+
+    # Summary
+    click.echo()
+    click.echo("=" * 50)
+
+    if errors:
+        click.echo(click.style(f"FAILED: {len(errors)} error(s), {len(warnings)} warning(s)", fg="red", bold=True))
+        sys.exit(1)
+    elif warnings and strict:
+        click.echo(click.style(f"FAILED (strict): {len(warnings)} warning(s)", fg="yellow", bold=True))
+        sys.exit(1)
+    elif warnings:
+        click.echo(click.style(f"PASSED with {len(warnings)} warning(s)", fg="yellow", bold=True))
+    else:
+        click.echo(click.style("PASSED: All checks passed", fg="green", bold=True))
+
+
+@app.command()
+@click.argument("app_id")
+@click.option("--url-only", is_flag=True, help="Show URL without opening browser")
+@click.option("--port", "-p", type=int, default=None, help="Specify port (if app exposes multiple)")
+@click.pass_context
+def ui(ctx, app_id, url_only, port):
+    """
+    Open app's web UI in browser.
+
+    Finds the app's exposed port and opens the web interface.
+    If the app exposes multiple ports, use --port to specify which one.
+
+    \b
+    Examples:
+        remake app ui com.example.app-dashboard
+        remake app ui com.example.app-dashboard --url-only
+        remake app ui myapp --port 8080
+    """
+    import subprocess
+    import webbrowser
+
+    # First check if app is running
+    running_apps = get_running_apps()
+
+    # Find matching app (exact match or partial)
+    matching = None
+    for name in running_apps:
+        if name == app_id or app_id in name:
+            matching = name
+            break
+
+    if not matching:
+        click.echo(f"App '{app_id}' is not running.", err=True)
+        click.echo()
+        click.echo("Running apps:")
+        if running_apps:
+            for name in running_apps:
+                click.echo(f"  - {name}")
+        else:
+            click.echo("  (none)")
+        sys.exit(1)
+
+    # Get port info
+    app_port = port
+    port_description = None
+
+    if not app_port:
+        # Try to get port from registry
+        try:
+            from ..runtime.app_registry import AppRegistry
+            registry = AppRegistry()
+            app_info = registry.get(matching)
+            if app_info and app_info.ports:
+                if len(app_info.ports) == 1:
+                    p = app_info.ports[0]
+                    app_port = p.host if hasattr(p, 'host') else p.get('host')
+                    port_description = p.description if hasattr(p, 'description') else p.get('description')
+                elif len(app_info.ports) > 1:
+                    click.echo("App exposes multiple ports:")
+                    for p in app_info.ports:
+                        host_port = p.host if hasattr(p, 'host') else p.get('host')
+                        desc = p.description if hasattr(p, 'description') else p.get('description', '')
+                        click.echo(f"  - {host_port}: {desc}" if desc else f"  - {host_port}")
+                    click.echo()
+                    click.echo("Use --port to specify which one.")
+                    sys.exit(1)
+        except Exception:
+            pass
+
+    if not app_port:
+        # Try to get from container port bindings
+        try:
+            result = subprocess.run(
+                ["podman", "inspect", matching, "--format", "{{json .HostConfig.PortBindings}}"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode == 0:
+                import json as json_module
+                bindings = json_module.loads(result.stdout.strip())
+                if bindings:
+                    # Get first port
+                    for container_port, host_bindings in bindings.items():
+                        if host_bindings:
+                            app_port = int(host_bindings[0].get('HostPort', 0))
+                            if app_port:
+                                break
+        except Exception:
+            pass
+
+    if not app_port:
+        # Try common ports
+        common_ports = [8080, 3000, 5000, 80, 443]
+        click.echo("No port information found. Trying common ports...")
+
+        import socket
+        for test_port in common_ports:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.5)
+                result = sock.connect_ex(('localhost', test_port))
+                sock.close()
+                if result == 0:
+                    app_port = test_port
+                    click.echo(f"Found open port: {app_port}")
+                    break
+            except Exception:
+                pass
+
+    if not app_port:
+        click.echo("Could not determine app's web port.", err=True)
+        click.echo()
+        click.echo("Specify the port manually:")
+        click.echo(f"  remake app ui {app_id} --port 8080")
+        sys.exit(1)
+
+    # Build URL
+    url = f"http://localhost:{app_port}"
+
+    if url_only:
+        click.echo(url)
+    else:
+        if port_description:
+            click.echo(f"Opening {port_description}...")
+        else:
+            click.echo(f"Opening {url}...")
+
+        try:
+            webbrowser.open(url)
+            click.echo(click.style(f"Opened {url} in browser", fg="green"))
+        except Exception as e:
+            click.echo(f"Could not open browser: {e}", err=True)
+            click.echo(f"Open manually: {url}")
+            sys.exit(1)
