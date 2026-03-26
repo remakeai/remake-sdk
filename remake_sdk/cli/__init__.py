@@ -7,6 +7,7 @@ Commands:
     remake status    - Show connection status
     remake connect   - Connect and listen for commands
     remake app       - App management (launch, stop, list)
+    remake sim       - Simulation management (start, stop, status)
 """
 
 import click
@@ -20,6 +21,7 @@ from .connect import connect
 from .app import app
 from .runtime import runtime
 from .dashboard import dashboard
+from .sim import sim
 
 
 def async_command(f):
@@ -52,6 +54,7 @@ cli.add_command(connect)
 cli.add_command(app)
 cli.add_command(runtime)
 cli.add_command(dashboard)
+cli.add_command(sim)
 
 
 def main():
