@@ -84,7 +84,3 @@ pytest --cov=remake_sdk
 | `remake_sdk.socketio` | Robot ↔ App communication (Socket.IO server) |
 | `remake_sdk.podman` | App container lifecycle management |
 | `remake_sdk.common` | Shared types and utilities |
-
-## License
-
-MIT
