@@ -40,14 +40,16 @@ def app(ctx):
 @click.option("--port", "ports", multiple=True, help="Port mapping (e.g., --port 8080:8080)")
 @click.option("--network-host", is_flag=True, help="Use host network (exposes all ports)")
 @click.option("--env", "-e", "env_vars", multiple=True, help="Environment variable (e.g., -e KEY=value)")
+@click.option("--backend", type=click.Choice(["agent", "podman", "auto"]), default=None,
+              help="Container backend (for --local)")
+@click.option("--agent-url", default=None, help="Host Agent URL (implies --backend agent)")
 @click.pass_context
-def launch(ctx, app_id, local, platform, timeout, image, ports, network_host, env_vars):
+def launch(ctx, app_id, local, platform, timeout, image, ports, network_host, env_vars, backend, agent_url):
     """
     Launch an app on the robot.
 
     By default, sends a launch request to the platform. Use --local
-    to launch the app directly using Podman without contacting the
-    cloud (useful for offline operation or development).
+    to launch the app directly without contacting the cloud.
 
     Port mappings are read from the app manifest automatically.
     Use --port to override or --network-host to expose all ports.
@@ -59,7 +61,12 @@ def launch(ctx, app_id, local, platform, timeout, image, ports, network_host, en
         remake app launch myapp --local --image localhost/myapp:dev
         remake app launch myapp --local --port 8080:8080
         remake app launch myapp --local --network-host
+        remake app launch myapp --local --backend agent
     """
+    # --agent-url implies --backend agent
+    if agent_url and not backend:
+        backend = "agent"
+
     # Parse environment variables
     env_dict = {}
     for env in env_vars:
@@ -71,129 +78,106 @@ def launch(ctx, app_id, local, platform, timeout, image, ports, network_host, en
     port_list = list(ports) if ports else None
 
     if local:
-        launch_local(app_id, image, ports=port_list, network_host=network_host, env_vars=env_dict)
+        launch_local(app_id, image, ports=port_list, network_host=network_host,
+                     env_vars=env_dict, backend=backend, agent_url=agent_url)
     else:
         launch_via_platform(app_id, platform, timeout)
 
 
-def launch_local(app_id: str, image: str = None, ports: list = None, network_host: bool = False, env_vars: dict = None):
-    """Launch app locally using Podman."""
-    import subprocess
+def launch_local(app_id: str, image: str = None, ports: list = None,
+                  network_host: bool = False, env_vars: dict = None,
+                  backend: str = None, agent_url: str = None):
+    """Launch app locally using the configured container backend."""
+    from ..runtime.app_manager import AppManager
+    from ..runtime.app_registry import AppRegistry
 
     click.echo(f"Launching app locally: {app_id}")
+
+    # Resolve backend from config if not specified via CLI
+    if backend is None:
+        try:
+            from ..platform.config import load_config
+            cfg = load_config()
+            backend = cfg.get("runtime", {}).get("backend", "auto")
+            if agent_url is None:
+                agent_url = cfg.get("runtime", {}).get("agent_url")
+        except Exception:
+            backend = "auto"
 
     # Determine container image and get app config from registry
     container_image = image
     app_ports = ports or []
     app_env = env_vars or {}
 
-    if not container_image:
-        # Try to get from registry
-        try:
-            from ..runtime.app_registry import AppRegistry
-            registry = AppRegistry()
+    try:
+        registry = AppRegistry()
+        if not container_image:
             app_info = registry.get(app_id)
             if app_info:
                 container_image = app_info.container_image
-                # Get ports from registry if not specified
                 if not app_ports and app_info.ports:
                     app_ports = app_info.ports
-                # Get environment from registry
                 if app_info.environment:
                     app_env = {**app_info.environment, **app_env}
-        except:
-            pass
+    except Exception:
+        pass
 
-        if not container_image:
-            container_image = f"registry.remake.ai/apps/{app_id}:latest"
+    if not container_image:
+        container_image = f"registry.remake.ai/apps/{app_id}:latest"
 
     click.echo(f"Using container: {container_image}")
 
     try:
-        # Stop existing container if running
-        subprocess.run(
-            ["podman", "stop", app_id],
-            capture_output=True,
-            timeout=10
-        )
-        subprocess.run(
-            ["podman", "rm", app_id],
-            capture_output=True,
-            timeout=10
-        )
+        manager = AppManager(registry=registry, backend=backend, agent_url=agent_url)
+        click.echo(f"Backend: {manager.backend_name}")
 
-        # Build podman command
-        cmd = ["podman", "run", "-d", "--rm", "--name", app_id]
-
-        # Add label for tracking
-        cmd.extend(["--label", f"remake.app_id={app_id}"])
-
-        # Network mode
-        if network_host:
-            cmd.extend(["--network", "host"])
-        else:
-            # Add port mappings
-            for port in app_ports:
-                if hasattr(port, 'container'):
-                    # PortMapping object
-                    cmd.extend(["-p", f"{port.host}:{port.container}"])
-                elif isinstance(port, dict):
-                    # Dict from manifest
-                    cmd.extend(["-p", f"{port['host']}:{port['container']}"])
-                elif isinstance(port, str):
-                    # String like "8080:8080"
-                    cmd.extend(["-p", port])
-
-        # Add environment variables
-        for key, value in app_env.items():
-            cmd.extend(["-e", f"{key}={value}"])
-
-        cmd.append(container_image)
-
-        # Start container
-        click.echo(f"Starting container {app_id}...")
-        if app_ports and not network_host:
-            port_list = []
+        # Build port config
+        port_config = None
+        if not network_host and app_ports:
+            port_config = []
             for p in app_ports:
-                if hasattr(p, 'host'):
-                    port_list.append(str(p.host))
+                if hasattr(p, 'container'):
+                    port_config.append({"host": p.host, "container": p.container})
                 elif isinstance(p, dict):
-                    port_list.append(str(p.get('host', p.get('container'))))
-            if port_list:
-                click.echo(f"Exposing ports: {', '.join(port_list)}")
+                    port_config.append({"host": p.get("host", p.get("container")), "container": p["container"]})
+                elif isinstance(p, str) and ":" in p:
+                    parts = p.split(":")
+                    port_config.append({"host": int(parts[0]), "container": int(parts[1])})
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=60
+        # Build network config
+        network = "host" if network_host else None
+
+        click.echo(f"Starting container {app_id}...")
+        if port_config:
+            port_list = [str(p["host"]) for p in port_config]
+            click.echo(f"Exposing ports: {', '.join(port_list)}")
+
+        success, result, message = manager.backend.run(
+            app_id=app_id,
+            image=container_image,
+            ports=port_config,
+            environment=app_env or None,
+            network=network,
         )
 
-        if result.returncode != 0:
-            click.echo(f"Error: {result.stderr.strip()}", err=True)
+        if not success:
+            click.echo(click.style(f"Error: {message or result}", fg="red"), err=True)
             sys.exit(1)
 
-        container_id = result.stdout.strip()[:12]
         click.echo(click.style("App launched!", fg="green"))
-        click.echo(f"Container ID: {container_id}")
+        click.echo(f"Container ID: {result}")
 
-        # Show access URLs for exposed ports
-        if app_ports and not network_host:
+        if port_config:
             click.echo()
-            for p in app_ports:
-                host_port = p.host if hasattr(p, 'host') else p.get('host')
-                desc = getattr(p, 'description', None) or p.get('description', '')
-                if desc:
-                    click.echo(f"  http://localhost:{host_port} - {desc}")
-                else:
-                    click.echo(f"  http://localhost:{host_port}")
+            for p in port_config:
+                click.echo(f"  http://localhost:{p['host']}")
 
         click.echo()
         click.echo(f"View logs: remake app logs {app_id}")
         click.echo(f"Stop app:  remake app stop {app_id}")
 
-    except FileNotFoundError:
-        click.echo("Podman is not installed.", err=True)
+    except RuntimeError as e:
+        click.echo(click.style(str(e), fg="red"), err=True)
         sys.exit(1)
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
@@ -282,8 +266,11 @@ def launch_via_platform(app_id: str, platform: str, timeout: int):
 @click.option("--timeout", "-t", default=30, help="Timeout in seconds")
 @click.option("--force", "-f", is_flag=True, help="Force stop (kill container)")
 @click.option("--all", "-a", "stop_all", is_flag=True, help="Stop all running apps")
+@click.option("--backend", type=click.Choice(["agent", "podman", "auto"]), default=None,
+              help="Container backend (for --local)")
+@click.option("--agent-url", default=None, help="Host Agent URL (implies --backend agent)")
 @click.pass_context
-def stop(ctx, app_id, local, platform, timeout, force, stop_all):
+def stop(ctx, app_id, local, platform, timeout, force, stop_all, backend, agent_url):
     """
     Stop a running app on the robot.
 
@@ -315,37 +302,48 @@ def stop(ctx, app_id, local, platform, timeout, force, stop_all):
             if not robot_id or not robot_secret:
                 local = True
 
+    # --agent-url implies --backend agent
+    if agent_url and not backend:
+        backend = "agent"
+
     if local:
-        stop_local(app_id, force, stop_all)
+        stop_local(app_id, force, stop_all, backend=backend, agent_url=agent_url)
     else:
         stop_via_platform(app_id, platform, timeout)
 
 
-def get_running_apps():
+def _get_manager(backend: str = None, agent_url: str = None):
+    """Create an AppManager with the given backend config."""
+    from ..runtime.app_manager import AppManager
+
+    if backend is None:
+        try:
+            from ..platform.config import load_config
+            cfg = load_config()
+            backend = cfg.get("runtime", {}).get("backend", "auto")
+            if agent_url is None:
+                agent_url = cfg.get("runtime", {}).get("agent_url")
+        except Exception:
+            backend = "auto"
+
+    return AppManager(backend=backend, agent_url=agent_url)
+
+
+def get_running_apps(backend: str = None, agent_url: str = None):
     """Get list of running app containers."""
-    import subprocess
-
     try:
-        result = subprocess.run(
-            ["podman", "ps", "--format", "{{.Names}}"],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        if result.returncode == 0:
-            return [name.strip() for name in result.stdout.strip().split("\n") if name.strip()]
-        return []
-    except:
+        manager = _get_manager(backend, agent_url)
+        return [c.app_id for c in manager.list_running()]
+    except Exception:
         return []
 
 
-def stop_local(app_id: str = None, force: bool = False, stop_all: bool = False):
-    """Stop app locally using Podman."""
-    import subprocess
-
+def stop_local(app_id: str = None, force: bool = False, stop_all: bool = False,
+               backend: str = None, agent_url: str = None):
+    """Stop app locally using the configured container backend."""
     # If no app_id specified, find running apps
     if not app_id:
-        running = get_running_apps()
+        running = get_running_apps(backend=backend, agent_url=agent_url)
 
         if not running:
             click.echo("No apps currently running.")
@@ -355,13 +353,11 @@ def stop_local(app_id: str = None, force: bool = False, stop_all: bool = False):
             app_id = running[0]
             click.echo(f"Found running app: {app_id}")
         elif stop_all:
-            # Stop all apps
             click.echo(f"Stopping {len(running)} app(s)...")
             for name in running:
-                _stop_container(name, force)
+                _stop_container(name, force, backend=backend, agent_url=agent_url)
             return
         else:
-            # Multiple apps - list them and ask
             click.echo("Multiple apps running:")
             for i, name in enumerate(running, 1):
                 click.echo(f"  {i}. {name}")
@@ -369,28 +365,25 @@ def stop_local(app_id: str = None, force: bool = False, stop_all: bool = False):
             click.echo("Specify an APP_ID or use --all to stop all apps.")
             return
 
-    _stop_container(app_id, force)
+    _stop_container(app_id, force, backend=backend, agent_url=agent_url)
 
 
-def _stop_container(app_id: str, force: bool = False):
+def _stop_container(app_id: str, force: bool = False,
+                    backend: str = None, agent_url: str = None):
     """Stop a single container."""
-    import subprocess
-
     click.echo(f"Stopping: {app_id}")
 
     try:
-        cmd = ["podman", "kill" if force else "stop", app_id]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        manager = _get_manager(backend, agent_url)
+        success, message = manager.stop(app_id, force=force)
 
-        if result.returncode == 0:
+        if success:
             click.echo(click.style(f"  Stopped {app_id}", fg="green"))
-        elif "no such container" in result.stderr.lower():
-            click.echo(f"  App {app_id} is not running.")
         else:
-            click.echo(f"  Error: {result.stderr.strip()}", err=True)
+            click.echo(f"  Error: {message}", err=True)
 
-    except FileNotFoundError:
-        click.echo("Podman is not installed.", err=True)
+    except RuntimeError as e:
+        click.echo(click.style(str(e), fg="red"), err=True)
         sys.exit(1)
     except Exception as e:
         click.echo(f"Error: {e}", err=True)

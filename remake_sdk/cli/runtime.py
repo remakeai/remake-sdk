@@ -36,8 +36,11 @@ def runtime(ctx):
 @click.option("--foreground", "-f", is_flag=True, help="Run in foreground (don't daemonize)")
 @click.option("--no-platform", is_flag=True, help="Don't connect to platform")
 @click.option("--port", default=8787, help="API port (default: 8787)")
+@click.option("--backend", type=click.Choice(["agent", "podman", "auto"]), default=None,
+              help="Container backend (default: from config or auto)")
+@click.option("--agent-url", default=None, help="Host Agent URL (implies --backend agent)")
 @click.pass_context
-def start(ctx, foreground, no_platform, port):
+def start(ctx, foreground, no_platform, port, backend, agent_url):
     """
     Start the runtime daemon.
 
@@ -49,6 +52,9 @@ def start(ctx, foreground, no_platform, port):
         remake runtime start
         remake runtime start --foreground
         remake runtime start --no-platform
+        remake runtime start --backend agent
+        remake runtime start --backend podman
+        remake runtime start --agent-url http://192.168.1.50:8785
     """
     from ..runtime.daemon import RuntimeDaemon, RuntimeConfig, run_daemon
 
@@ -59,10 +65,16 @@ def start(ctx, foreground, no_platform, port):
         click.echo(f"API: {RUNTIME_API_URL}")
         return
 
+    # --agent-url implies --backend agent
+    if agent_url and not backend:
+        backend = "agent"
+
     config = RuntimeConfig(
         api_port=port,
         connect_to_platform=not no_platform,
-        pid_file=PID_FILE
+        pid_file=PID_FILE,
+        backend=backend,
+        agent_url=agent_url,
     )
 
     if foreground:

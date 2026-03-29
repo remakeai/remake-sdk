@@ -33,6 +33,8 @@ class RuntimeConfig:
     robot_secret: Optional[str] = None
     connect_to_platform: bool = True
     pid_file: Path = Path("/tmp/remake-runtime.pid")
+    backend: Optional[str] = None  # "agent", "podman", "auto", or None (use config file)
+    agent_url: Optional[str] = None
 
 
 class RuntimeDaemon:
@@ -48,9 +50,29 @@ class RuntimeDaemon:
     def __init__(self, config: Optional[RuntimeConfig] = None):
         self.config = config or RuntimeConfig()
 
+        # Resolve backend config: CLI flags override config file
+        backend = self.config.backend
+        agent_url = self.config.agent_url
+        if backend is None or agent_url is None:
+            try:
+                from ..platform.config import load_config
+                file_config = load_config()
+                runtime_cfg = file_config.get("runtime", {})
+                if backend is None:
+                    backend = runtime_cfg.get("backend", "auto")
+                if agent_url is None:
+                    agent_url = runtime_cfg.get("agent_url")
+            except Exception:
+                if backend is None:
+                    backend = "auto"
+
         # Core components
         self.registry = AppRegistry()
-        self.app_manager = AppManager(self.registry)
+        self.app_manager = AppManager(
+            self.registry,
+            backend=backend,
+            agent_url=agent_url,
+        )
         self.api = RuntimeAPI(
             self.app_manager,
             self.registry,

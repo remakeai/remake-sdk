@@ -44,6 +44,8 @@ class PlatformConfig:
     # Runtime settings
     runtime_mode: str = "prod"  # "prod", "dev", "mock"
     socket_path: str = "/var/run/remake/robot.sock"
+    backend: str = "auto"  # "agent", "podman", or "auto"
+    agent_url: Optional[str] = None
 
     @classmethod
     def from_file(cls, config_path: Optional[Path] = None) -> "PlatformConfig":
@@ -61,6 +63,8 @@ class PlatformConfig:
             heartbeat_interval=config.get("platform", {}).get("heartbeat_interval", 30.0),
             runtime_mode=config.get("runtime", {}).get("mode", "prod"),
             socket_path=config.get("runtime", {}).get("socket_path", "/var/run/remake/robot.sock"),
+            backend=config.get("runtime", {}).get("backend", "auto"),
+            agent_url=config.get("runtime", {}).get("agent_url"),
         )
 
 
@@ -78,6 +82,8 @@ def _default_config() -> Dict[str, Any]:
             "mode": "prod",
             "socket_path": "/var/run/remake/robot.sock",
             "dashboard_port": 8080,
+            "backend": "auto",
+            "agent_url": None,
         },
         "simulation": {
             "default_simulator": "unity",

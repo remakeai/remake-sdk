@@ -45,6 +45,9 @@ podman = [
 mqtt = [
     "paho-mqtt>=2.0",
 ]
+agent = [
+    "docker>=7.0",
+]
 all = [
     "remake-sdk[platform,socketio,podman,mqtt]",
 ]
@@ -60,7 +63,7 @@ Documentation = "https://docs.remake.ai/sdk"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["remake_sdk*"]
+include = ["remake_sdk*", "remake_agent*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

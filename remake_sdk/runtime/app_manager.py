@@ -1,5 +1,10 @@
 """
-App Manager - Manage app containers via Podman.
+App Manager - Manage app containers via pluggable backends.
+
+Supports:
+- PodmanBackend: Local Podman subprocess calls
+- HostAgentBackend: HTTP calls to the Host Agent
+- Auto-detection: tries Host Agent first, falls back to Podman
 """
 
 import logging
@@ -36,7 +41,7 @@ class ContainerStatus:
 
 class AppManager:
     """
-    Manages app lifecycle using Podman.
+    Manages app lifecycle using a pluggable container backend.
 
     Handles:
     - Installing apps (pulling container images)
@@ -44,27 +49,95 @@ class AppManager:
     - Launching apps (running containers)
     - Stopping apps (stopping containers)
     - Checking app status
+
+    Backend selection (runtime.backend config):
+    - "agent": Always use the Host Agent
+    - "podman": Always use local Podman
+    - "auto": Try Host Agent first, fall back to Podman (default)
     """
 
-    # Default registry for remake apps
     DEFAULT_REGISTRY = "registry.remake.ai/apps"
 
-    def __init__(self, registry: Optional[AppRegistry] = None):
+    def __init__(
+        self,
+        registry: Optional[AppRegistry] = None,
+        backend: str = "auto",
+        agent_url: Optional[str] = None,
+    ):
+        """
+        Args:
+            registry: App registry for tracking installed apps
+            backend: Backend selection - "agent", "podman", or "auto"
+            agent_url: Host Agent URL (for "agent" or "auto" backend)
+        """
         self.registry = registry or AppRegistry()
-        self._podman_available = self._check_podman()
+        self._backend_name = backend
+        self._agent_url = agent_url
+        self._backend = None  # Lazy-resolved
 
-    def _check_podman(self) -> bool:
-        """Check if podman is available."""
-        try:
-            result = subprocess.run(
-                ["podman", "--version"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            return result.returncode == 0
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            return False
+    @property
+    def backend(self):
+        """Resolve and cache the container backend."""
+        if self._backend is None:
+            self._backend = self._resolve_backend()
+        return self._backend
+
+    def _resolve_backend(self):
+        """Select container backend with auto-detection."""
+        from .backends.podman import PodmanBackend
+        from .backends.agent_client import HostAgentBackend
+
+        configured = self._backend_name
+
+        if configured == "agent":
+            agent_url = self._agent_url or HostAgentBackend.DEFAULT_AGENT_URL if hasattr(HostAgentBackend, 'DEFAULT_AGENT_URL') else self._agent_url
+            backend = HostAgentBackend(agent_url) if agent_url else HostAgentBackend()
+            if not backend.is_available():
+                raise RuntimeError(
+                    f"Host Agent not reachable at {backend.agent_url}. "
+                    "Start the agent with: python -m remake_agent"
+                )
+            logger.info(f"Using Host Agent backend at {backend.agent_url}")
+            return backend
+
+        if configured == "podman":
+            backend = PodmanBackend()
+            if not backend.is_available():
+                raise RuntimeError(
+                    "Podman is not installed or not accessible. "
+                    "Install with: apt-get install podman"
+                )
+            logger.info("Using Podman backend")
+            return backend
+
+        # Auto-detect: try Host Agent first, fall back to Podman
+        if self._agent_url:
+            agent_backend = HostAgentBackend(self._agent_url)
+            if agent_backend.is_available():
+                logger.info(f"Host Agent detected at {self._agent_url}, using agent backend")
+                return agent_backend
+
+        podman_backend = PodmanBackend()
+        if podman_backend.is_available():
+            logger.info("Podman detected, using podman backend")
+            return podman_backend
+
+        raise RuntimeError(
+            "No container backend available. "
+            "Either start the Host Agent or install Podman."
+        )
+
+    @property
+    def backend_name(self) -> str:
+        """Return the name of the active backend."""
+        from .backends.podman import PodmanBackend
+        from .backends.agent_client import HostAgentBackend
+        b = self.backend
+        if isinstance(b, HostAgentBackend):
+            return "agent"
+        if isinstance(b, PodmanBackend):
+            return "podman"
+        return "unknown"
 
     def install(
         self,
@@ -93,77 +166,29 @@ class AppManager:
         Returns:
             InstallResult with success status
         """
-        if not self._podman_available:
-            return InstallResult(
-                success=False,
-                app_id=app_id,
-                error="podman_not_available",
-                message="Podman is not installed or not accessible"
-            )
-
-        # Determine container image
         if not container_image:
             container_image = f"{self.DEFAULT_REGISTRY}/{app_id}:{version}"
 
         logger.info(f"Installing app {app_id} from {container_image}")
 
-        # Check if image already exists locally
-        image_exists = False
-        try:
-            result = subprocess.run(
-                ["podman", "image", "exists", container_image],
-                capture_output=True,
-                timeout=10
-            )
-            image_exists = result.returncode == 0
-        except Exception:
-            pass
-
-        # Pull the image only if it doesn't exist locally
-        if not image_exists:
-            try:
-                logger.info(f"Pulling image {container_image}...")
-                result = subprocess.run(
-                    ["podman", "pull", container_image],
-                    capture_output=True,
-                    text=True,
-                    timeout=300  # 5 minute timeout for large images
-                )
-
-                if result.returncode != 0:
-                    logger.error(f"Failed to pull image: {result.stderr}")
-                    return InstallResult(
-                        success=False,
-                        app_id=app_id,
-                        container_image=container_image,
-                        error="pull_failed",
-                        message=f"Failed to pull image: {result.stderr.strip()}"
-                    )
-
-            except subprocess.TimeoutExpired:
+        # Pull the image if it doesn't exist locally
+        if not self.backend.image_exists(container_image):
+            success, error = self.backend.pull(container_image)
+            if not success:
                 return InstallResult(
                     success=False,
                     app_id=app_id,
                     container_image=container_image,
-                    error="timeout",
-                    message="Image pull timed out"
-                )
-            except Exception as e:
-                return InstallResult(
-                    success=False,
-                    app_id=app_id,
-                    container_image=container_image,
-                    error="exception",
-                    message=str(e)
+                    error="pull_failed",
+                    message=error
                 )
         else:
-            logger.info(f"Image {container_image} already exists locally")
+            logger.info(f"Image {container_image} already exists")
 
         # Extract ports and environment from manifest
         ports = None
         environment = None
         if manifest:
-            # Get name/description from manifest if not provided
             if not name:
                 name = manifest.get("name")
             if not description:
@@ -171,7 +196,6 @@ class AppManager:
             if not entitlements:
                 entitlements = manifest.get("capabilities") or manifest.get("entitlements")
 
-            # Parse ports
             if manifest.get("ports"):
                 ports = [
                     PortMapping(
@@ -183,7 +207,6 @@ class AppManager:
                     for p in manifest["ports"]
                 ]
 
-            # Get environment
             environment = manifest.get("environment")
 
         # Register the app
@@ -234,15 +257,8 @@ class AppManager:
         self.stop(app_id, force=True)
 
         # Remove the image
-        if remove_image and self._podman_available:
-            try:
-                subprocess.run(
-                    ["podman", "rmi", "-f", app.container_image],
-                    capture_output=True,
-                    timeout=60
-                )
-            except Exception as e:
-                logger.warning(f"Failed to remove image: {e}")
+        if remove_image:
+            self.backend.remove_image(app.container_image)
 
         # Remove from registry
         self.registry.remove(app_id)
@@ -270,47 +286,16 @@ class AppManager:
         Returns:
             Tuple of (success, container_id or error, message)
         """
-        if not self._podman_available:
-            return False, "podman_not_available", "Podman is not installed"
-
-        # Get app info
         app = self.registry.get(app_id)
         if not app and not container_image:
             return False, "not_installed", f"App {app_id} is not installed"
 
         image = container_image or app.container_image
 
-        # Stop existing container if running
-        self.stop(app_id, force=True)
-
-        # Build run command
-        cmd = [
-            "podman", "run",
-            "-d",  # Detached
-            "--rm",  # Remove on exit
-            "--name", app_id,
-            # TODO: Map entitlements to capabilities/devices
-        ]
-
-        # Add the image
-        cmd.append(image)
-
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            if result.returncode != 0:
-                return False, "launch_failed", result.stderr.strip()
-
-            container_id = result.stdout.strip()[:12]
-            return True, container_id, "App launched successfully"
-
-        except Exception as e:
-            return False, "exception", str(e)
+        return self.backend.run(
+            app_id=app_id,
+            image=image,
+        )
 
     def stop(self, app_id: str, force: bool = False) -> Tuple[bool, str]:
         """
@@ -323,93 +308,12 @@ class AppManager:
         Returns:
             Tuple of (success, message)
         """
-        if not self._podman_available:
-            return False, "Podman is not installed"
-
-        cmd = ["podman", "kill" if force else "stop", app_id]
-
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            if result.returncode == 0:
-                return True, "App stopped"
-            elif "no such container" in result.stderr.lower():
-                return True, "App was not running"
-            else:
-                return False, result.stderr.strip()
-
-        except Exception as e:
-            return False, str(e)
+        return self.backend.stop(app_id, force=force)
 
     def status(self, app_id: str) -> Optional[ContainerStatus]:
         """Get status of a running app container."""
-        if not self._podman_available:
-            return None
-
-        try:
-            result = subprocess.run(
-                ["podman", "inspect", "--format",
-                 "{{.Id}}|{{.State.Status}}|{{.Config.Image}}|{{.State.StartedAt}}",
-                 app_id],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            if result.returncode != 0:
-                return None
-
-            parts = result.stdout.strip().split("|")
-            if len(parts) >= 4:
-                return ContainerStatus(
-                    app_id=app_id,
-                    container_id=parts[0][:12],
-                    status=parts[1],
-                    image=parts[2],
-                    started_at=parts[3][:19].replace("T", " ") if parts[3] else None
-                )
-
-        except Exception:
-            pass
-
-        return None
+        return self.backend.status(app_id)
 
     def list_running(self) -> List[ContainerStatus]:
         """List all running app containers."""
-        if not self._podman_available:
-            return []
-
-        try:
-            result = subprocess.run(
-                ["podman", "ps", "--format",
-                 "{{.Names}}|{{.ID}}|{{.Status}}|{{.Image}}"],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            if result.returncode != 0:
-                return []
-
-            containers = []
-            for line in result.stdout.strip().split("\n"):
-                if not line:
-                    continue
-                parts = line.split("|")
-                if len(parts) >= 4:
-                    containers.append(ContainerStatus(
-                        app_id=parts[0],
-                        container_id=parts[1][:12],
-                        status=parts[2],
-                        image=parts[3]
-                    ))
-
-            return containers
-
-        except Exception:
-            return []
+        return self.backend.list_running()
