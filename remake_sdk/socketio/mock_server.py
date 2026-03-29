@@ -276,4 +276,13 @@ async def run_mock_server(host: str = "127.0.0.1", port: int = 8788):
 
 
 if __name__ == "__main__":
-    asyncio.run(run_mock_server())
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Mock Robot Server")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="Bind address (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8788,
+                        help="Port (default: 8788)")
+    args = parser.parse_args()
+
+    asyncio.run(run_mock_server(host=args.host, port=args.port))
