@@ -276,6 +276,8 @@ def api_command():
 
     # Queue command for async execution
     command_queue.append(command)
+    if main_loop:
+        main_loop.call_soon_threadsafe(command_event.set)
     add_log(f"Command queued: {command}", "info")
 
     return jsonify({"status": "queued", "command": command})
@@ -294,6 +296,8 @@ def health():
 
 # Command queue for async processing
 command_queue = []
+command_event = asyncio.Event()
+main_loop = None  # Set to the asyncio event loop once running
 
 
 def add_log(message: str, level: str = "info"):
@@ -406,25 +410,29 @@ class AppDashboard:
         logger.info("App is running. Press Ctrl+C to stop.")
         add_log("Main loop started", "info")
 
-        counter = 0
+        heartbeat_counter = 0
         while self.running:
-            counter += 1
+            # Wait for a command or timeout for heartbeat
+            try:
+                await asyncio.wait_for(command_event.wait(), timeout=1.0)
+                command_event.clear()
+            except asyncio.TimeoutError:
+                pass
 
-            # Process any queued commands
+            # Process any queued commands immediately
             await self.process_commands()
 
             # Periodic heartbeat every 30 seconds
-            if counter % 30 == 0 and app_state["connected"]:
+            heartbeat_counter += 1
+            if heartbeat_counter % 30 == 0 and app_state["connected"]:
                 await self.client.log(
-                    f"Heartbeat #{counter // 30}",
+                    f"Heartbeat #{heartbeat_counter // 30}",
                     level="debug",
                     data={
                         "battery": app_state["battery"]["level"],
                         "pose": app_state["pose"],
                     }
                 )
-
-            await asyncio.sleep(1)
 
     async def stop(self):
         """Stop the app gracefully."""
@@ -455,10 +463,12 @@ def run_flask():
 
 async def main():
     """Main entry point."""
+    global main_loop
     app = AppDashboard()
 
     # Handle signals
     loop = asyncio.get_event_loop()
+    main_loop = loop
 
     def signal_handler():
         asyncio.create_task(app.stop())
